@@ -1,0 +1,286 @@
+#!/usr/bin/env bash
+
+LEGACY_PLUGIN_DIR='/opt/cisco/secureclient/bin/plugins'
+UMBRELLA_PLUGIN_DIR='/opt/cisco/secureclient/bin/umbrella/plugins'
+
+PLUGIN_DIRS=("$UMBRELLA_PLUGIN_DIR" "$LEGACY_PLUGIN_DIR")
+PLUGIN_FILES=(
+    "libacumbrellaapi.dylib"
+    "libacumbrellactrl.dylib"
+    "libacumbrellaplugin.dylib"
+)
+
+read -r -d '' USAGE << EGASU
+Usage: `basename $0` [-s|-e|-d|-h]
+
+    -s, --status    Print Umbrella Roaming Security module status
+    -e, --enable    Enable Umbrella Roaming Security module
+    -d, --disable   Disable Umbrella Roaming Security module
+    -h, --help      Show this message.
+    No argument or an invalid option opens an interactive menu.
+EGASU
+
+if [[ -t 1 ]]; then
+    GREEN=$'\033[32m'
+    RED=$'\033[31m'
+    RESET=$'\033[0m'
+else
+    GREEN=''
+    RED=''
+    RESET=''
+fi
+
+function print_success {
+    printf '%b\n' "${GREEN}$1${RESET}"
+}
+
+function print_error {
+    printf '%b\n' "${RED}$1${RESET}"
+}
+
+function prompt_for_menu {
+    local invalid_arg=$1
+
+    if [[ -n $invalid_arg ]]; then
+        echo "Unrecognized option: $invalid_arg" >&2
+    fi
+
+    while true; do
+        cat <<'EOT' >&2
+Select an action:
+  1) Print Umbrella Roaming Security module status
+  2) Enable Umbrella Roaming Security module
+  3) Disable Umbrella Roaming Security module
+  4) Exit
+EOT
+        printf '> ' >&2
+        read -r choice
+        case $choice in
+            1) echo '--status'; return 0 ;;
+            2) echo '--enable'; return 0 ;;
+            3) echo '--disable'; return 0 ;;
+            4|q|Q|exit|EXIT) return 1 ;;
+            *) echo "Invalid selection. Please try again." >&2 ;;
+        esac
+        printf '\n' >&2
+    done
+}
+
+function run_as_root {
+    if [[ $EUID -eq 0 ]]; then
+        "$@"
+    else
+        sudo "$@"
+    fi
+}
+
+function file_is_active {
+    local lib=$1
+    local dir
+    for dir in "${PLUGIN_DIRS[@]}"; do
+        [[ -d $dir ]] || continue
+        if [[ -f $dir/$lib ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+function file_is_disabled {
+    local lib=$1
+    local dir
+    for dir in "${PLUGIN_DIRS[@]}"; do
+        [[ -d $dir/disabled ]] || continue
+        if [[ -f $dir/disabled/$lib ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+function assess_status {
+    local enabled=0
+    local disabled=0
+    local lib
+    local total=${#PLUGIN_FILES[@]}
+
+    for lib in "${PLUGIN_FILES[@]}"; do
+        if file_is_active "$lib"; then
+            ((enabled++))
+        elif file_is_disabled "$lib"; then
+            ((disabled++))
+        fi
+    done
+
+    if (( enabled == total )); then
+        return 0
+    elif (( disabled == total )); then
+        return 1
+    else
+        return 2
+    fi
+}
+
+function disable_plugin {
+    local lib
+    local dir
+
+    for lib in "${PLUGIN_FILES[@]}"; do
+        for dir in "${PLUGIN_DIRS[@]}"; do
+            [[ -d $dir ]] || continue
+            if [[ -f $dir/$lib ]]; then
+                run_as_root mkdir -p "$dir/disabled" || return 1
+                run_as_root mv -f "$dir/$lib" "$dir/disabled/" || return 1
+            fi
+        done
+    done
+
+    assess_status
+    case $? in
+        1) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+function enable_plugin {
+    local lib
+    local dir
+
+    for lib in "${PLUGIN_FILES[@]}"; do
+        for dir in "${PLUGIN_DIRS[@]}"; do
+            [[ -d $dir/disabled ]] || continue
+            if [[ -f $dir/disabled/$lib ]]; then
+                run_as_root mv -f "$dir/disabled/$lib" "$dir/" || return 1
+            fi
+        done
+    done
+
+    assess_status
+    case $? in
+        0) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+function handle_status {
+    assess_status
+    local status=$?
+
+    if [[ $status -eq 0 ]]; then
+        print_success "Umbrella Roaming Security Module for AnyConnect is ENABLED."
+        return 0
+    elif [[ $status -eq 1 ]]; then
+        print_success "Umbrella Roaming Security Module for AnyConnect is DISABLED."
+        return 0
+    else
+        print_error "ERROR: Unable to determine Umbrella Roaming Security Module status."
+        return 1
+    fi
+}
+
+function handle_enable {
+    assess_status
+    local status=$?
+
+    if [[ $status -eq 1 ]]; then
+        if enable_plugin; then
+            print_success "Umbrella Roaming Security Module for AnyConnect has been ENABLED."
+            return 0
+        fi
+        print_error "ERROR: Umbrella Roaming Security Module for AnyConnect can only be enabled if it has previously been disabled by this utility."
+        return 1
+    elif [[ $status -eq 0 ]]; then
+        print_error "ERROR: Umbrella Roaming Security Module for AnyConnect is already enabled."
+        return 1
+    else
+        print_error "ERROR: Unable to determine Umbrella Roaming Security Module status."
+        return 1
+    fi
+}
+
+function handle_disable {
+    assess_status
+    local status=$?
+
+    if [[ $status -eq 0 ]]; then
+        if disable_plugin; then
+            print_success "Umbrella Roaming Security Module for AnyConnect has been DISABLED."
+            return 0
+        fi
+        print_error "ERROR: Failed to disable Umbrella Roaming Security Module for AnyConnect."
+        return 1
+    elif [[ $status -eq 1 ]]; then
+        print_error "ERROR: Umbrella Roaming Security Module for AnyConnect does not appear to be enabled."
+        return 1
+    else
+        print_error "ERROR: Unable to determine Umbrella Roaming Security Module status."
+        return 1
+    fi
+}
+
+action=$1
+interactive_mode=0
+
+if [[ -z $action ]]; then
+    interactive_mode=1
+elif [[ ! $action =~ ^(-s|--status|-e|--enable|-d|--disable|-h|--help)$ ]]; then
+    interactive_mode=1
+fi
+
+while true; do
+    case "$action" in
+        '')
+            if ! action=$(prompt_for_menu); then
+                exit 0
+            fi
+            interactive_mode=1
+            continue
+            ;;
+        '-s'|'--status')
+            handle_status
+            exit_code=$?
+            if (( interactive_mode )); then
+                action=''
+                continue
+            else
+                exit $exit_code
+            fi
+            ;;
+        '-e'|'--enable')
+            handle_enable
+            exit_code=$?
+            if (( interactive_mode )); then
+                action=''
+                continue
+            else
+                exit $exit_code
+            fi
+            ;;
+        '-d'|'--disable')
+            handle_disable
+            exit_code=$?
+            if (( interactive_mode )); then
+                action=''
+                continue
+            else
+                exit $exit_code
+            fi
+            ;;
+        '-h'|'--help')
+            echo "$USAGE"
+            exit 0
+            ;;
+        *)
+            if (( interactive_mode )); then
+                if ! action=$(prompt_for_menu "$action"); then
+                    exit 0
+                fi
+                interactive_mode=1
+                continue
+            else
+                echo "$USAGE"
+                exit 1
+            fi
+            ;;
+    esac
+done
